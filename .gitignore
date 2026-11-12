@@ -18,3 +18,8 @@ tests/*.trs
 configure~
 test-suite.log
 tests/.dirstamp
+
+# makepkg artifacts
+src/
+pkg/
+*.pkg.tar.*
