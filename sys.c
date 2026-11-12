@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "sys.h"
 
 #define sys_errno(msg, ...) \
 	trace(msg ": %s", ##__VA_ARGS__, strerror(errno))
@@ -61,7 +62,7 @@ int sys_gettime(unsigned long *interval)
 		return rc;
 	}
 
-	*interval = ts.tv_sec;
+	*interval = (unsigned long) ts.tv_sec;
 
 	return 0;
 }
@@ -76,7 +77,7 @@ int sys_setitimer(unsigned long interval)
 
 	rc = setitimer(ITIMER_REAL, &itv, NULL);
 	if (rc == -1) {
-		sys_errno("setitimer(ITIMER_REAL, %ld)", interval);
+		sys_errno("setitimer(ITIMER_REAL, %lu)", interval);
 		rc = -errno;
 		return rc;
 	}
@@ -121,8 +122,14 @@ int sys_waitpid(pid_t pid, int *code)
 	if (w == 0)
 		return -ECHILD;
 
-	if (code)
-		*code = WEXITSTATUS(status);
+	if (code) {
+		if (WIFEXITED(status))
+			*code = WEXITSTATUS(status);
+		else if (WIFSIGNALED(status))
+			*code = 128 + WTERMSIG(status);
+		else
+			*code = 0;
+	}
 
 	return 0;
 }
@@ -250,7 +257,7 @@ int sys_open(const char *path, int *fd)
 {
 	int rc;
 
-	rc = open(path, O_RDONLY | O_NONBLOCK);
+	rc = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	if (rc == -1) {
 		sys_errno("open(%s)", path);
 		rc = -errno;
@@ -281,13 +288,19 @@ int sys_read(int fd, void *buf, size_t size, size_t *count)
 {
 	ssize_t rc;
 
-	rc = read(fd, buf, size);
-	if (rc == -1) {
-		sys_errno("read(%d, %ld)", fd, size);
-		rc = -errno;
-		if (rc == -EWOULDBLOCK)
-			rc = -EAGAIN;
-		return rc;
+	for (;;) {
+		rc = read(fd, buf, size);
+		if (rc >= 0)
+			break;
+
+		if (errno == EINTR)
+			continue;
+
+		sys_errno("read(%d, %zu)", fd, size);
+		if (errno == EWOULDBLOCK || errno == EAGAIN)
+			return -EAGAIN;
+
+		return -errno;
 	}
 
 	/* End of file or pipe */
@@ -410,7 +423,7 @@ static int sys_setfl(int fd, int flags)
 
 int sys_cloexec(int fd)
 {
-	int flags;
+	int flags = 0;
 	int err;
 
 	err = sys_getfd(fd, &flags);
@@ -424,7 +437,7 @@ int sys_cloexec(int fd)
 int sys_async(int fd, int sig)
 {
 	pid_t pid;
-	int flags;
+	int flags = 0;
 	int err;
 
 	err = sys_getfl(fd, &flags);
@@ -432,10 +445,10 @@ int sys_async(int fd, int sig)
 		return err;
 
 	if (sig) {
-    		pid = getpid();
+		pid = getpid();
 		flags |= (O_ASYNC | O_NONBLOCK);
 	} else {
-    		pid = 0;
+		pid = 0;
 		flags &= ~(O_ASYNC | O_NONBLOCK);
 	}
 
@@ -460,7 +473,17 @@ int sys_pipe(int *fds)
 	rc = pipe(fds);
 	if (rc == -1) {
 		sys_errno("pipe()");
-		rc = -errno;
+		return -errno;
+	}
+
+	/* Never leak pipe ends into block processes. */
+	rc = sys_cloexec(fds[0]);
+	if (!rc)
+		rc = sys_cloexec(fds[1]);
+	if (rc) {
+		sys_close(fds[0]);
+		sys_close(fds[1]);
+		fds[0] = fds[1] = -1;
 		return rc;
 	}
 
@@ -479,6 +502,19 @@ int sys_fork(pid_t *pid)
 	}
 
 	*pid = rc;
+
+	return 0;
+}
+
+int sys_kill(pid_t pid, int sig)
+{
+	int rc;
+
+	rc = kill(pid, sig);
+	if (rc == -1) {
+		sys_errno("kill(%d, %d)", pid, sig);
+		return -errno;
+	}
 
 	return 0;
 }
@@ -505,18 +541,7 @@ int sys_execsh(const char *command)
 	return 0;
 }
 
-int sys_isatty(int fd)
+bool sys_isatty(int fd)
 {
-	int rc;
-
-	rc = isatty(fd);
-	if (rc == 0) {
-		sys_errno("isatty(%d)", fd);
-		rc = -errno;
-		if (rc == -EINVAL)
-			rc = -ENOTTY;
-		return rc;
-	}
-
-	return 0;
+	return isatty(fd) == 1;
 }

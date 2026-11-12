@@ -26,6 +26,7 @@
 
 struct bar {
 	struct block *blocks;
+	struct block *tail;
 	sigset_t sigset;
 	bool term;
 };

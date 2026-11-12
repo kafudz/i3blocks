@@ -70,34 +70,50 @@ static void bar_stop(struct bar *bar)
 	debug("bar stopped");
 }
 
-static void bar_poll_timed(struct bar *bar)
+static bool bar_poll_timed(struct bar *bar)
 {
 	struct block *block = bar->blocks;
+	bool updated = false;
 
 	while (block) {
 		/* spawn unless it is only meant for click or signal */
 		if (block->interval != 0) {
 			block_spawn(block);
 			block_touch(block);
+
+			/*
+			 * A persistent command may have written its first
+			 * line before signal-driven I/O was enabled; drain
+			 * whatever is already available.
+			 */
+			if (block->interval == INTERVAL_PERSIST &&
+			    block->out[0] >= 0 &&
+			    line_pending(block->out[0])) {
+				block_update(block);
+				updated = true;
+			}
 		}
 
 		block = block->next;
 	}
+
+	return updated;
 }
 
 static void bar_poll_expired(struct bar *bar)
 {
 	struct block *block = bar->blocks;
+	unsigned long now;
+	int err;
+
+	err = sys_gettime(&now);
+	if (err)
+		return;
 
 	while (block) {
 		if (block->interval > 0) {
-			const unsigned long next_update = block->timestamp + block->interval;
-			unsigned long now;
-			int err;
-
-			err = sys_gettime(&now);
-			if (err)
-				return;
+			const unsigned long next_update =
+				block->timestamp + (unsigned long) block->interval;
 
 			if (((long) (next_update - now)) <= 0) {
 				block_debug(block, "expired");
@@ -148,11 +164,20 @@ static void bar_poll_exited(struct bar *bar)
 		if (block) {
 			block_debug(block, "exited");
 			block_reap(block);
+
+			/* Drain any complete lines left in the pipe. */
 			if (block->interval == INTERVAL_PERSIST) {
-				block_debug(block, "unexpected exit?");
+				while (block->out[0] >= 0 &&
+				       line_pending(block->out[0]))
+					block_update(block);
 			} else {
 				block_update(block);
 			}
+
+			if (block->interval == INTERVAL_PERSIST) {
+				block_debug(block, "unexpected exit?");
+			}
+
 			block_close(block);
 			if (block->interval == INTERVAL_REPEAT) {
 				block_spawn(block);
@@ -169,23 +194,46 @@ static void bar_poll_exited(struct bar *bar)
 
 static void bar_poll_readable(struct bar *bar, const int fd)
 {
-	struct block *block = bar->blocks;
+	struct block *block;
+	int err;
 
-	while (block) {
-		if (block->out[0] == fd) {
-			block_debug(block, "readable");
-			block_update(block);
+	for (block = bar->blocks; block; block = block->next) {
+		if (block->out[0] != fd)
+			continue;
+
+		block_debug(block, "readable");
+
+		/*
+		 * A persistent block may have several complete lines
+		 * buffered.  Each line is a full update, so drain them
+		 * all now instead of waiting for another SIGIO.
+		 */
+		if (block->interval == INTERVAL_PERSIST && !line_pending(fd))
 			break;
-		}
 
-		block = block->next;
+		do {
+			err = block_update(block);
+			if (err) {
+				block_error(block, "failed to update block");
+				break;
+			}
+
+			bar_print(bar);
+		} while (block->interval == INTERVAL_PERSIST &&
+			 line_pending(fd));
+
+		break;
 	}
 }
 
 static int gcd(int a, int b)
 {
-	while (b != 0)
-		a %= b, a ^= b, b ^= a, a ^= b;
+	while (b != 0) {
+		int remainder = a % b;
+
+		a = b;
+		b = remainder;
+	}
 
 	return a;
 }
@@ -292,18 +340,20 @@ static int bar_setup(struct bar *bar)
 
 static void bar_teardown(struct bar *bar)
 {
-	struct block *block = bar->blocks;
+	struct block *block;
 	int err;
 
-	/* Disable event I/O for blocks (persistent) */
-	while (block) {
-		if (block->interval == INTERVAL_PERSIST) {
+	/* Stop children and close their pipes before waiting for them. */
+	for (block = bar->blocks; block; block = block->next) {
+		/* Disable event I/O for persistent blocks */
+		if (block->interval == INTERVAL_PERSIST &&
+		    block->out[0] >= 0) {
 			err = sys_async(block->out[0], 0);
 			if (err)
 				block_error(block, "failed to disable event I/O");
 		}
 
-		block = block->next;
+		block_stop(block);
 	}
 
 	/* Disable event I/O for stdin (clicks) */
@@ -323,6 +373,10 @@ static void bar_teardown(struct bar *bar)
 	if (err)
 		error("failed to wait for any child");
 
+	/* Children have all been reaped; do not signal their PIDs again. */
+	for (block = bar->blocks; block; block = block->next)
+		block->pid = 0;
+
 	debug("bar tear down");
 }
 
@@ -339,7 +393,8 @@ static int bar_poll(struct bar *bar)
 	bar_print(bar);
 
 	/* First forks (for commands with an interval) */
-	bar_poll_timed(bar);
+	if (bar_poll_timed(bar))
+		bar_print(bar);
 
 	while (1) {
 		err = sys_sigwaitinfo(&bar->sigset, &sig, &fd);
@@ -371,7 +426,6 @@ static int bar_poll(struct bar *bar)
 
 		if (sig == SIGRTMIN) {
 			bar_poll_readable(bar, fd);
-			bar_print(bar);
 			continue;
 		}
 
@@ -433,31 +487,30 @@ static int bar_config_cb(const struct map *map, void *data)
 {
 	struct bar *bar = data;
 	struct block *block;
-	struct block *prev;
 
 	block = block_create(bar, map);
 	if (!block)
 		return -ENOMEM;
 
-	if (bar->blocks) {
-		prev = bar->blocks;
-		while (prev->next)
-			prev = prev->next;
-		prev->next = block;
-	} else {
+	if (bar->tail)
+		bar->tail->next = block;
+	else
 		bar->blocks = block;
-	}
+
+	bar->tail = block;
 
 	return 0;
 }
 
-static void bar_load(struct bar *bar, const char *path)
+static int bar_load(struct bar *bar, const char *path)
 {
 	int err;
 
 	err = config_load(path, bar_config_cb, bar);
 	if (err)
 		bar_fatal(bar, "Failed to load configuration file %s", path);
+
+	return err;
 }
 
 int bar_init(bool term, const char *path)
@@ -469,7 +522,11 @@ int bar_init(bool term, const char *path)
 	if (!bar)
 		return -ENOMEM;
 
-	bar_load(bar, path);
+	err = bar_load(bar, path);
+	if (err) {
+		bar_destroy(bar);
+		return err;
+	}
 
 	err = bar_poll(bar);
 

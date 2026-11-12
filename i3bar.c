@@ -16,6 +16,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "bar.h"
 #include "block.h"
 #include "json.h"
@@ -26,7 +30,7 @@
 
 /* See https://i3wm.org/docs/i3bar-protocol.html for details */
 
-static struct {
+static const struct {
 	const char * const key;
 	bool string;
 } i3bar_keys[] = {
@@ -54,9 +58,9 @@ static struct {
 	{ "border_right", false },
 };
 
-static unsigned int i3bar_indexof(const char *key)
+static size_t i3bar_indexof(const char *key)
 {
-	unsigned int i;
+	size_t i;
 
 	for (i = 0; i < sizeof(i3bar_keys) / sizeof(i3bar_keys[0]); i++)
 		if (strcmp(i3bar_keys[i].key, key) == 0)
@@ -67,12 +71,12 @@ static unsigned int i3bar_indexof(const char *key)
 
 static int i3bar_line_cb(char *line, size_t num, void *data)
 {
-	unsigned int index = num + 1;
+	size_t index = num + 1;
 	struct map *map = data;
 	const char *key;
 
 	if (index >= sizeof(i3bar_keys) / sizeof(i3bar_keys[0])) {
-		debug("ignoring excess line %d: %s", num, line);
+		debug("ignoring excess line %zu: %s", num, line);
 		return 0;
 	}
 
@@ -106,7 +110,7 @@ static void i3bar_print_term(const struct bar *bar)
 
 static int i3bar_print_pair(const char *key, const char *value, void *data)
 {
-	unsigned int index = i3bar_indexof(key);
+	size_t index = i3bar_indexof(key);
 	bool string = i3bar_keys[index].string;
 	unsigned int *pcount = data;
 	char buf[BUFSIZ];
@@ -175,14 +179,15 @@ static int i3bar_print_block(struct block *block, void *data)
 {
 	struct block *block = bar->blocks;
 	unsigned int mcount = 0;
-	int err;
+	int err = 0;
 
 	if (bar->term) {
 		i3bar_print_term(bar);
 		return 0;
 	}
+	if (fputs(",[", stdout) == EOF)
+		return -EIO;
 
-	fprintf(stdout, ",[");
 	while (block) {
 		err = i3bar_print_block(block, &mcount);
 		if (err)
@@ -190,8 +195,12 @@ static int i3bar_print_block(struct block *block, void *data)
 
 		block = block->next;
 	}
-	fprintf(stdout, "]\n");
-	fflush(stdout);
+
+	if (fputs("]\n", stdout) == EOF)
+		err = -EIO;
+
+	if (fflush(stdout) == EOF || ferror(stdout))
+		err = -EIO;
 
 	return err;
 }
@@ -211,11 +220,9 @@ int i3bar_printf(struct block *block, int lvl, const char *msg)
 	if (err)
 		return err;
 
-	if (lvl <= LOG_ERROR) {
-		err = map_set(map, "urgent", "true");
-		if (err)
-			return err;
-	}
+	err = map_set(map, "urgent", "true");
+	if (err)
+		return err;
 
 	return i3bar_print(bar);
 }
@@ -226,8 +233,10 @@ int i3bar_start(struct bar *bar)
 		term_save_cursor();
 		term_restore_cursor();
 	} else {
-		fprintf(stdout, "{\"version\":1,\"click_events\":true}\n[[]\n");
-		fflush(stdout);
+		if (fprintf(stdout, "{\"version\":1,\"click_events\":true}\n[[]\n") < 0)
+			return -EIO;
+		if (fflush(stdout) == EOF)
+			return -EIO;
 	}
 
 	return 0;
@@ -250,12 +259,20 @@ static struct block *i3bar_find(struct bar *bar, const struct map *map)
 	struct block *block = bar->blocks;
 
 	/* "name" and "instance" are the only identifiers provided by i3bar */
-	map_name = map_get(map, "name") ? : "";
-	map_instance = map_get(map, "instance") ? : "";
+	map_name = map_get(map, "name");
+	if (!map_name)
+		map_name = "";
+	map_instance = map_get(map, "instance");
+	if (!map_instance)
+		map_instance = "";
 
 	while (block) {
-		block_name = block_get(block, "name") ? : "";
-		block_instance = block_get(block, "instance") ? : "";
+		block_name = block_get(block, "name");
+		if (!block_name)
+			block_name = "";
+		block_instance = block_get(block, "instance");
+		if (!block_instance)
+			block_instance = "";
 
 		if (strcmp(block_name, map_name) == 0 &&
 		    strcmp(block_instance, map_instance) == 0)
@@ -271,7 +288,7 @@ int i3bar_click(struct bar *bar)
 {
 	struct block *block;
 	struct map *click;
-	int err;
+	int err = 0;
 
 	click = map_create();
 	if (!click)
@@ -323,7 +340,8 @@ int i3bar_setup(struct block *block)
 {
 	const char *instance = map_get(block->config, "instance");
 	const char *name = map_get(block->config, "name");
-	char buf[BUFSIZ];
+	size_t len;
+	char *pretty;
 	int err;
 
 	/* A block needs a name to be clickable */
@@ -334,14 +352,21 @@ int i3bar_setup(struct block *block)
 			return err;
 	}
 
+	len = strlen(name);
 	if (instance)
-		snprintf(buf, sizeof(buf), "%s:%s", name, instance);
-	else
-		snprintf(buf, sizeof(buf), "%s", name);
+		len += strlen(instance) + 1;
 
-	block->name = strdup(buf);
-	if (!block->name)
+	pretty = malloc(len + 1);
+	if (!pretty)
 		return -ENOMEM;
+
+	if (instance)
+		snprintf(pretty, len + 1, "%s:%s", name, instance);
+	else
+		memcpy(pretty, name, len + 1);
+
+	free(block->name);
+	block->name = pretty;
 
 	return 0;
 }

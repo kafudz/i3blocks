@@ -21,14 +21,16 @@
 #endif
 
 #include <getopt.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "bar.h"
 #include "log.h"
 #include "sys.h"
 
-unsigned int log_level;
+enum log_level log_level;
 
 int main(int argc, char *argv[])
 {
@@ -37,7 +39,12 @@ int main(int argc, char *argv[])
 	bool term;
 	int c;
 
-	while (c = getopt(argc, argv, "c:o:vhV"), c != -1) {
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		error("failed to ignore SIGPIPE");
+		return EXIT_FAILURE;
+	}
+
+	while ((c = getopt(argc, argv, "c:o:vhV")) != -1) {
 		switch (c) {
 		case 'c':
 			path = optarg;
@@ -60,9 +67,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	term = !sys_isatty(STDOUT_FILENO);
+	if (output && strcmp(output, "term") != 0) {
+		error("unknown output '%s', expected 'term'", output);
+		return EXIT_FAILURE;
+	}
+
+	term = sys_isatty(STDOUT_FILENO);
 	if (output)
-		term = !strcmp(output, "term");
+		term = true;
 
 	if (bar_init(term, path))
 		return EXIT_FAILURE;

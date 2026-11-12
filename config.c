@@ -16,13 +16,17 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
 #include <libgen.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "config.h"
 #include "ini.h"
+#include "line.h"
 #include "log.h"
 #include "map.h"
 #include "sys.h"
@@ -40,29 +44,48 @@ struct config {
 
 static int config_finalize(struct config *conf)
 {
-	int err;
+	int err = 0;
 
-	if (conf->section) {
-		if (conf->cb) {
-			err = conf->cb(conf->section, conf->data);
-			if (err)
-				return err;
-		}
+	if (!conf->section)
+		return 0;
 
-		conf->section = NULL;
-	}
+	if (conf->cb)
+		err = conf->cb(conf->section, conf->data);
 
-	return 0;
+	/* The callback is expected to copy what it needs. */
+	map_destroy(conf->section);
+	conf->section = NULL;
+
+	return err;
+}
+
+static void config_free(struct config *conf)
+{
+	if (conf->section)
+		map_destroy(conf->section);
+	if (conf->global)
+		map_destroy(conf->global);
+
+	conf->section = NULL;
+	conf->global = NULL;
 }
 
 static int config_reset(struct config *conf)
 {
+	int err;
+
 	conf->section = map_create();
 	if (!conf->section)
 		return -ENOMEM;
 
-	if (conf->global)
-		return map_copy(conf->section, conf->global);
+	if (conf->global) {
+		err = map_copy(conf->section, conf->global);
+		if (err) {
+			map_destroy(conf->section);
+			conf->section = NULL;
+			return err;
+		}
+	}
 
 	return 0;
 }
@@ -116,37 +139,74 @@ static int config_read(struct config *conf, int fd)
 	return config_finalize(conf);
 }
 
+/* Format "dir/name" and reject silent truncation. */
+static int config_path(char *buf, size_t size, const char *dir,
+		       const char *name)
+{
+	int len;
+
+	len = snprintf(buf, size, "%s/%s", dir, name);
+	if (len < 0 || (size_t) len >= size)
+		return -ENAMETOOLONG;
+
+	return 0;
+}
+
 static int config_open(struct config *conf, const char *path)
 {
-	size_t plen = strlen(path);
-	char pname[plen + 1];
+	char pname[PATH_MAX];
 	char *dname;
 	int err;
 	int fd;
 
 	debug("try file %s", path);
 
+	if (strlen(path) >= sizeof(pname)) {
+		error("configuration path too long: %s", path);
+		return -ENAMETOOLONG;
+	}
+	strcpy(pname, path);
+
 	err = sys_open(path, &fd);
 	if (err)
 		return err;
 
-	strcpy(pname, path);
 	dname = dirname(pname);
 	err = sys_chdir(dname);
 	if (err) {
 		error("failed to change directory to %s", dname);
+		sys_close(fd);
 		return err;
 	}
 
 	debug("changed directory to %s", dname);
 
 	err = config_read(conf, fd);
+	line_forget(fd);
 	sys_close(fd);
 
-	if (conf->global)
+	if (conf->global) {
 		map_destroy(conf->global);
+		conf->global = NULL;
+	}
+
+	if (err)
+		config_free(conf);
 
 	return err;
+}
+
+/* Try a default configuration path; ENOENT means "keep looking". */
+static int config_try(struct config *conf, const char *dir, const char *name)
+{
+	char buf[PATH_MAX];
+	int err;
+
+	err = config_path(buf, sizeof(buf), dir, name);
+	if (err)
+		return err;
+
+	return config_open(conf, buf);
 }
 
 int config_load(const char *path, config_cb_t *cb, void *data)
@@ -161,36 +221,62 @@ int config_load(const char *path, config_cb_t *cb, void *data)
 	char buf[PATH_MAX];
 	int err;
 
-
 	/* command line config file? */
-	if (path)
-		return config_open(&conf, path);
+	if (path) {
+		err = config_open(&conf, path);
+		if (err)
+			config_free(&conf);
+		return err;
+	}
 
 	/* user config file? */
-	if (home) {
-		if (xdg_home)
-			snprintf(buf, sizeof(buf), "%s/i3blocks/config", xdg_home);
-		else
-			snprintf(buf, sizeof(buf), "%s/.config/i3blocks/config", home);
-		err = config_open(&conf, buf);
+	if (home && *home) {
+		if (xdg_home && *xdg_home) {
+			err = config_try(&conf, xdg_home, "i3blocks/config");
+		} else {
+			err = config_try(&conf, home,
+					 ".config/i3blocks/config");
+		}
 		if (err != -ENOENT)
 			return err;
 
-		snprintf(buf, sizeof(buf), "%s/.i3blocks.conf", home);
-		err = config_open(&conf, buf);
+		err = config_try(&conf, home, ".i3blocks.conf");
 		if (err != -ENOENT)
 			return err;
 	}
 
 	/* system config file? */
-	if (xdg_dirs)
-		snprintf(buf, sizeof(buf), "%s/i3blocks/config", xdg_dirs);
-	else
-		snprintf(buf, sizeof(buf), "%s/xdg/i3blocks/config", SYSCONFDIR);
-	err = config_open(&conf, buf);
-	if (err != -ENOENT)
-		return err;
+	if (xdg_dirs && *xdg_dirs) {
+		const char *dir = xdg_dirs;
 
-	snprintf(buf, sizeof(buf), "%s/i3blocks.conf", SYSCONFDIR);
-	return config_open(&conf, buf);
+		while (*dir) {
+			const char *end = strchr(dir, ':');
+			size_t len = end ? (size_t)(end - dir) : strlen(dir);
+
+			if (len) {
+				if (len >= sizeof(buf)) {
+					err = -ENAMETOOLONG;
+				} else {
+					memcpy(buf, dir, len);
+					buf[len] = '\0';
+					err = config_try(&conf, buf,
+							 "i3blocks/config");
+				}
+
+				if (err != -ENOENT)
+					return err;
+			}
+
+			if (!end)
+				break;
+			dir = end + 1;
+		}
+	} else {
+		err = config_try(&conf, SYSCONFDIR "/xdg",
+				 "i3blocks/config");
+		if (err != -ENOENT)
+			return err;
+	}
+
+	return config_try(&conf, SYSCONFDIR, "i3blocks.conf");
 }

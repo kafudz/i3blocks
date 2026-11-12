@@ -22,50 +22,70 @@
 
 #include "map.h"
 
+#define MAP_BUCKETS	16
+#define MAP_LOAD_NUM	3
+#define MAP_LOAD_DEN	4
+
 struct pair {
 	char *key;
 	char *value;
 
+	/* Insertion order, used to keep map_for_each() deterministic. */
 	struct pair *next;
+
+	/* Hash bucket chain, used for lookups. */
+	struct pair *hash_next;
 };
 
 struct map {
-	struct pair *head;
+	struct pair *head;	/* sentinel node */
+	struct pair *tail;
+	struct pair **buckets;
+	size_t nbuckets;
+	size_t count;
 };
 
-static struct pair *map_head(const struct map *map)
+static size_t map_hash(const char *key)
 {
-	return map->head;
+	const unsigned char *p = (const unsigned char *)key;
+	size_t hash = 5381;
+
+	while (*p)
+		hash = ((hash << 5) + hash) ^ *p++;
+
+	return hash;
 }
 
-/* Return previous pair if key is found, last pair otherwise */
-static struct pair *map_prev(const struct map *map, const char *key)
+static struct pair *map_lookup(const struct map *map, const char *key)
 {
-	struct pair *prev = map_head(map);
-	struct pair *next = prev->next;
+	struct pair *pair;
+	size_t bucket;
 
-	while (next) {
-		if (strcmp(next->key, key) == 0)
-			break;
+	if (!key || !map->nbuckets)
+		return NULL;
 
-		prev = next;
-		next = next->next;
-	}
+	bucket = map_hash(key) % map->nbuckets;
+	for (pair = map->buckets[bucket]; pair; pair = pair->hash_next)
+		if (strcmp(pair->key, key) == 0)
+			return pair;
 
-	return prev;
+	return NULL;
 }
 
-/* Update the value of a pair */
+/* Update the value of a pair.  Duplicate first so that value may alias
+ * the current pair value without being freed before it is copied. */
 static int map_reassign(struct pair *pair, const char *value)
 {
-	free(pair->value);
-	pair->value = NULL;
+	char *copy = NULL;
 
 	if (value) {
-		pair->value = strdup(value);
-		if (!pair->value)
+		copy = strdup(value);
+		if (!copy)
 			return -ENOMEM;
 	}
+
+	free(pair->value);
+	pair->value = copy;
 
 	return 0;
 }
@@ -74,7 +94,9 @@ static int map_reassign(struct pair *pair, const char *value)
 static struct pair *map_pair(const char *key, const char *value)
 {
 	struct pair *pair;
-	int err;
+
+	if (!key)
+		return NULL;
 
 	pair = calloc(1, sizeof(struct pair));
 	if (!pair)
@@ -86,8 +108,7 @@ static struct pair *map_pair(const char *key, const char *value)
 		return NULL;
 	}
 
-	err = map_reassign(pair, value);
-	if (err) {
+	if (map_reassign(pair, value)) {
 		free(pair->key);
 		free(pair);
 		return NULL;
@@ -96,16 +117,50 @@ static struct pair *map_pair(const char *key, const char *value)
 	return pair;
 }
 
-/* Destroy a new key-value pair */
-void map_unpair(struct pair *pair)
+/* Destroy a key-value pair */
+static void map_unpair(struct pair *pair)
 {
 	map_reassign(pair, NULL);
 	free(pair->key);
 	free(pair);
 }
 
-/* Insert a key-value pair after a given pair */
-static int map_insert(struct pair *prev, const char *key, const char *value)
+static void map_hash_insert(struct map *map, struct pair *pair)
+{
+	size_t bucket = map_hash(pair->key) % map->nbuckets;
+
+	pair->hash_next = map->buckets[bucket];
+	map->buckets[bucket] = pair;
+}
+
+static int map_resize(struct map *map, size_t nbuckets)
+{
+	struct pair **buckets;
+	struct pair **old;
+	struct pair *pair;
+	size_t i;
+
+	buckets = calloc(nbuckets, sizeof(*buckets));
+	if (!buckets)
+		return -ENOMEM;
+
+	old = map->buckets;
+	map->buckets = buckets;
+	map->nbuckets = nbuckets;
+
+	for (pair = map->head->next; pair; pair = pair->next) {
+		i = map_hash(pair->key) % nbuckets;
+		pair->hash_next = buckets[i];
+		buckets[i] = pair;
+	}
+
+	free(old);
+
+	return 0;
+}
+
+/* Append a key-value pair to the end of the insertion order list */
+static int map_insert(struct map *map, const char *key, const char *value)
 {
 	struct pair *pair;
 
@@ -113,50 +168,42 @@ static int map_insert(struct pair *prev, const char *key, const char *value)
 	if (!pair)
 		return -ENOMEM;
 
-	pair->next = prev->next;
-	prev->next = pair;
+	/* Grow lazily; a failed resize is harmless, only slower. */
+	if (map->count + 1 > map->nbuckets * MAP_LOAD_NUM / MAP_LOAD_DEN)
+		map_resize(map, map->nbuckets * 2);
+
+	pair->next = NULL;
+	map->tail->next = pair;
+	map->tail = pair;
+	map_hash_insert(map, pair);
+	map->count++;
 
 	return 0;
 }
 
-/* Delete the key-value pair after a given pair */
-static void map_delete(struct pair *prev)
-{
-	struct pair *pair = prev->next;
-
-	prev->next = pair->next;
-	map_unpair(pair);
-}
-
 const char *map_get(const struct map *map, const char *key)
 {
-	struct pair *prev = map_prev(map, key);
-	struct pair *next = prev->next;
+	struct pair *pair = map_lookup(map, key);
 
-	if (next)
-		return next->value;
-	else
-		return NULL;
+	return pair ? pair->value : NULL;
 }
 
 int map_set(struct map *map, const char *key, const char *value)
 {
-	struct pair *prev = map_prev(map, key);
-	struct pair *next = prev->next;
+	struct pair *pair = map_lookup(map, key);
 
-	if (next)
-		return map_reassign(next, value);
-	else
-		return map_insert(prev, key, value);
+	if (pair)
+		return map_reassign(pair, value);
+
+	return map_insert(map, key, value);
 }
 
 int map_for_each(const struct map *map, map_func_t *func, void *data)
 {
-	struct pair *pair = map_head(map);
+	struct pair *pair;
 	int err;
 
-	while (pair->next) {
-		pair = pair->next;
+	for (pair = map->head->next; pair; pair = pair->next) {
 		err = func(pair->key, pair->value, data);
 		if (err)
 			return err;
@@ -167,10 +214,22 @@ int map_for_each(const struct map *map, map_func_t *func, void *data)
 
 void map_clear(struct map *map)
 {
-	struct pair *pair = map_head(map);
+	struct pair *pair = map->head->next;
 
-	while (pair->next)
-		map_delete(pair);
+	while (pair) {
+		struct pair *next = pair->next;
+
+		map_unpair(pair);
+		pair = next;
+	}
+
+	map->head->next = NULL;
+	map->tail = map->head;
+	map->count = 0;
+
+	if (map->buckets)
+		memset(map->buckets, 0,
+		       map->nbuckets * sizeof(*map->buckets));
 }
 
 static int map_dup(const char *key, const char *value, void *data)
@@ -187,8 +246,12 @@ int map_copy(struct map *map, const struct map *base)
 
 void map_destroy(struct map *map)
 {
+	if (!map)
+		return;
+
 	map_clear(map);
 	free(map->head);
+	free(map->buckets);
 	free(map);
 }
 
@@ -205,6 +268,16 @@ struct map *map_create(void)
 		free(map);
 		return NULL;
 	}
+
+	map->buckets = calloc(MAP_BUCKETS, sizeof(*map->buckets));
+	if (!map->buckets) {
+		free(map->head);
+		free(map);
+		return NULL;
+	}
+
+	map->tail = map->head;
+	map->nbuckets = MAP_BUCKETS;
 
 	return map;
 }

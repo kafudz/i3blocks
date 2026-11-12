@@ -19,6 +19,7 @@
 #ifndef SYS_H
 #define SYS_H
 
+#include <stdbool.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -50,9 +51,10 @@ int sys_async(int fd, int sig);
 
 int sys_pipe(int *fds);
 int sys_fork(pid_t *pid);
+int sys_kill(pid_t pid, int sig);
 void sys_exit(int status);
 int sys_execsh(const char *command);
 
-int sys_isatty(int fd);
+bool sys_isatty(int fd);
 
 #endif /* SYS_H */

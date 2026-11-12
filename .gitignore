@@ -11,4 +11,10 @@ config.status
 configure
 i3blocks-config.h*
 stamp-h1
+tests/test_unit
+tests/*.log
+tests/*.trs
 
+configure~
+test-suite.log
+tests/.dirstamp
